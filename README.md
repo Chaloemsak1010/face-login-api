@@ -1,14 +1,18 @@
 # Face Attendance API (Proof of Concept)
 
-A lightweight C# ASP.NET Core 8 Web API demonstrating face recognition, vector storage, and similarity verification. This POC integrates **ONNX Runtime** for local face embedding extraction using the **ArcFace (`arc.onnx`)** model and **PostgreSQL with pgvector** for persistent vector storage.
+A lightweight C# ASP.NET Core 8 Web API demonstrating face recognition, vector storage, and similarity verification. This POC integrates **ONNX Runtime** for local face embedding extraction using the **ArcFace (`arc.onnx`)** model and **PostgreSQL with pgvector** for persistent vector storage and in-database similarity search.
+
+> 📖 Full endpoint reference (request/response schemas, error tables): [API-Documentation.md](API-Documentation.md)
 
 ---
 
 ## 🌟 Key Features
 
-- **Face Embedding Extraction**: Preprocesses images locally using `SixLabors.ImageSharp` and extracts 512-dimensional facial feature vectors using the `arc.onnx` model (ONNX Runtime).
+- **Face Embedding Extraction**: Preprocesses images locally using `SixLabors.ImageSharp` and extracts 512-dimensional facial feature vectors using the `arc.onnx` model (ONNX Runtime). Supports both NCHW and NHWC model input layouts (auto-detected at startup).
 - **Vector Database Storage**: Uses PostgreSQL combined with the `pgvector` extension to persist facial vectors.
-- **Local Cosine Similarity Verification**: Compares face check-in request embeddings against registered embeddings using high-performance C# vector arithmetic.
+- **In-Database Similarity Search**: Check-in verification computes cosine distance directly inside PostgreSQL using the pgvector `<=>` operator, so only a single scalar (the best score) crosses the wire — not every registered 512-dimension vector.
+- **Multi-Angle Enrollment**: An employee can register multiple face images (different angles); check-in matches against the best-scoring one.
+- **Audit Logging**: Every check-in attempt — matched or not — is recorded in the `checkinlogs` table with its similarity score and status.
 
 ---
 
@@ -16,31 +20,31 @@ A lightweight C# ASP.NET Core 8 Web API demonstrating face recognition, vector s
 
 - **Framework**: ASP.NET Core 8 Web API
 - **Machine Learning Inference**: Microsoft.ML.OnnxRuntime (v1.26.0)
-- **Face Model**: ArcFace (Arc.onnx) - 512-dimension output vector
+- **Face Model**: ArcFace (`arc.onnx`) - 512-dimension output vector
 - **Image Processing**: SixLabors.ImageSharp (v2.1.12)
-- **Database Provider**: EF Core with Npgsql (PostgreSQL)
+- **Database Provider**: EF Core 8 with Npgsql (PostgreSQL)
 - **Vector Search Support**: pgvector extension & Pgvector.EntityFrameworkCore
-- **JSON Handler**: System.Text.Json (v10.0.9)
+- **SIMD Math**: System.Numerics.Tensors (`TensorPrimitives.CosineSimilarity`) for local vector comparison
 
 ---
 
 ## 📂 Project Structure
 
+All source files live flat in the project root:
+
 ```text
-├── Data/
-│   └── AppDbContext.cs            # EF Core DbContext mapping pgvector extension and schemas
-├── Models/
-│   └── Models.cs                  # Database models (Employee, EmployeeFaceEmbedding, CheckInLog)
-├── Services/
-│   ├── IFaceEmbeddingService.cs   # Service interface
-│   └── FaceEmbeddingService.cs    # ONNX inference + Cosine Similarity calculations
-├── Controllers/
-│   └── FaceController.cs          # REST endpoints (/api/register, /api/checkin, /api/employees)
+├── Program.cs                 # API services setup, middleware, and CORS configuration
+├── FaceController.cs          # REST endpoints (/api/register, /api/checkin, /api/employees)
+├── FaceEmbeddingService.cs    # IFaceEmbeddingService + ONNX inference & cosine similarity
+├── AppDbContext.cs            # EF Core DbContext mapping pgvector extension and schemas
+├── Models.cs                  # Database models (Employee, EmployeeFaceEmbedding, CheckInLog)
+├── schema.sql                 # PostgreSQL schema (tables, indexes, pgvector notes)
+├── test-api.ps1               # End-to-end PowerShell test script for all endpoints
+├── API-Documentation.md       # Detailed REST API reference
 ├── ml-models/
-│   └── arc.onnx                   # Face embedding ONNX model (512 dimensions)
-├── StoredFaces/                   # Local folder created dynamically to store raw uploaded pictures
-├── appsettings.json               # Application and DB settings
-└── Program.cs                     # API services setup, middleware, and CORS configuration
+│   └── arc.onnx               # Face embedding ONNX model (512 dimensions)
+├── appsettings.json           # Application and DB settings
+└── FaceAttendance.Api.http    # REST Client requests for quick manual testing
 ```
 
 ---
@@ -48,52 +52,59 @@ A lightweight C# ASP.NET Core 8 Web API demonstrating face recognition, vector s
 ## 🔧 Installation & Prerequisites
 
 ### 1. PostgreSQL & pgvector Setup
-Ensure that a PostgreSQL instance is running with the `pgvector` extension installed. Refer to the official [pgvector documentation](https://github.com/pgvector/pgvector) for installation and database initialization details.
+
+Ensure a PostgreSQL instance is running with the [pgvector](https://github.com/pgvector/pgvector) extension installed, then create the schema:
+
+```sql
+-- 1. Enable the extension in your database
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+```bash
+# 2. Create the tables and indexes
+psql -h localhost -U your-username -d your-database -f schema.sql
+```
+
+> Note: there are no EF Core migrations in this project — the schema is created from `schema.sql`.
 
 ### 2. ONNX Model Setup
-Ensure that the ArcFace ONNX model (`arc.onnx`) is located in the `ml-models` directory of the application:
+
+Place the ArcFace ONNX model at:
+
 ```text
 ml-models/arc.onnx
 ```
-*Note: The C# build configuration is set up to automatically copy this file to the build output directory (`CopyToOutputDirectory: PreserveNewest`).*
+
+The application throws a fatal `FileNotFoundException` at startup if the model file is missing. The model path is configurable via `FaceModel:Path` and is resolved relative to the working directory (run `dotnet run` from the project root).
 
 ---
 
 ## ⚙ Configuration (`appsettings.json`)
 
-Configure your database connection and verification thresholds in `appsettings.json`:
-
 ```json
 {
-  "Logging": {
-    "LogLevel": {
-      "Default": "Information",
-      "Microsoft.AspNetCore": "Warning"
-    }
-  },
-  "AllowedHosts": "*",
   "FaceModel": {
     "Path": "ml-models/arc.onnx",
     "Threshold": 0.70
   },
   "ConnectionStrings": {
-    "DefaultConnection": "Host=your-database-host;Port=5432;Database=your-database-name;Username=your-username;Password=your-password;Include Error Detail=true"
+    "DefaultConnection": "Host=your-host;Port=5432;Database=your-db;Username=your-user;Password=your-password;Include Error Detail=true"
   }
 }
 ```
 
 - **`FaceModel:Path`**: File path to the ONNX model.
-- **`FaceModel:Threshold`**: Similarity score threshold (range `0.0` - `1.0`). If the similarity score is greater than or equal to this threshold, the check-in is successful. Default is `0.70` (70%).
-- **`ConnectionStrings:DefaultConnection`**: Connection string pointing to your PostgreSQL instance.
+- **`FaceModel:Threshold`**: Cosine-similarity threshold (`0.0`–`1.0`). A check-in succeeds when the best similarity score is **≥** this value. Default `0.70` (70%).
+- **`ConnectionStrings:DefaultConnection`**: PostgreSQL connection string (pgvector extension required).
 
 ---
 
 ## 🗄 Database Schema Design
 
-The DB schema is structured as follows:
+See [`schema.sql`](schema.sql) for the full DDL.
 
 ### 1. `employees`
-Stores employee information.
+Employee master data.
 - `id` (int, Primary Key)
 - `employee_code` (varchar(50), Unique Index)
 - `first_name` (varchar(100))
@@ -101,41 +112,47 @@ Stores employee information.
 - `created_at` (timestamp, default: CURRENT_TIMESTAMP)
 
 ### 2. `employeefaceembeddings`
-Stores registered facial vector profiles mapping back to the employee. An employee can have multiple registered angles (1-to-many relationship).
+Registered facial vectors, 1-to-many per employee (multi-angle enrollment).
 - `id` (int, Primary Key)
-- `employee_id` (int, Foreign Key to `employees` with cascade delete)
-- `embedding_data` (vector(512), PostgreSQL pgvector type)
-- `image_path` (varchar(500), physical path where the raw file is stored)
+- `employee_id` (int, FK to `employees`, cascade delete)
+- `embedding_data` (`vector(512)`, pgvector type)
+- `image_path` (varchar(500)) — *currently stored as a placeholder; raw images are not persisted in this POC*
 - `created_at` (timestamp, default: CURRENT_TIMESTAMP)
 
 ### 3. `checkinlogs`
-Audit logs of all check-in attempts.
+Audit log of all check-in attempts.
 - `id` (int, Primary Key)
-- `employee_id` (int, Foreign key to `employees`)
+- `employee_id` (int, FK to `employees`, cascade delete)
 - `check_in_time` (timestamp, default: CURRENT_TIMESTAMP)
 - `similarity_score` (float)
-- `status` (varchar(50), e.g. "SUCCESS", "FAILED_MATCH_UNDER_THRESHOLD")
+- `status` (varchar(50): `SUCCESS` or `FAILED_MATCH_UNDER_THRESHOLD`)
 
 ---
 
 ## 📡 API Endpoints
 
-### 1. Register Employee Faces
-- **Endpoint**: `POST /api/register`
-- **Description**: Registers a new or existing employee with one or more facial angles. Images are preprocessed and saved, their embeddings are generated, and vectors are persisted to the database.
-- **Request Body**:
+Base URL (local dev): `http://localhost:5002`. All bodies are JSON; images are base64 strings (an optional `data:image/...;base64,` prefix is stripped automatically).
+
+Full details, validation rules, and error responses: **[API-Documentation.md](API-Documentation.md)**.
+
+### 1. Register Employee Faces — `POST /api/register`
+
+Registers one or more face images for a new **or existing** employee (new embeddings are added to an existing profile). Employee code matching is case-insensitive.
+
 ```json
 {
-  "EmployeeCode": "EMP001",
-  "FirstName": "Jane",
-  "LastName": "Doe",
-  "FaceImagesBase64": [
-    "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ...", 
-    "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ..."
+  "employeeCode": "EMP001",
+  "firstName": "Jane",
+  "lastName": "Doe",
+  "faceImagesBase64": [
+    "data:image/jpeg;base64,/9j/4AAQSkZJRg...",
+    "data:image/jpeg;base64,/9j/4AAQSkZJRg..."
   ]
 }
 ```
-- **Response**:
+
+Response `200 OK`:
+
 ```json
 {
   "message": "Employee face profiles registered successfully.",
@@ -151,17 +168,19 @@ Audit logs of all check-in attempts.
 }
 ```
 
-### 2. Employee Face Check-In
-- **Endpoint**: `POST /api/checkin`
-- **Description**: Verifies a check-in image against all registered angles of the specified employee code. Generates embedding, computes the highest Cosine Similarity, and logs verification results.
-- **Request Body**:
+### 2. Employee Face Check-In — `POST /api/checkin`
+
+Extracts the embedding from the submitted image and finds the **highest cosine similarity** across the employee's registered angles — computed inside PostgreSQL via the pgvector `<=>` (cosine distance) operator. Every attempt is written to `checkinlogs`.
+
 ```json
 {
-  "EmployeeCode": "EMP001",
-  "FaceImageBase64": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ..."
+  "employeeCode": "EMP001",
+  "faceImageBase64": "data:image/jpeg;base64,/9j/4AAQSkZJRg..."
 }
 ```
-- **Response (Success)**:
+
+Response `200 OK` (both match and non-match return 200 — check `success`):
+
 ```json
 {
   "success": true,
@@ -174,32 +193,21 @@ Audit logs of all check-in attempts.
   "execution_time_ms": 145
 }
 ```
-- **Response (Failure - Below Threshold)**:
-```json
-{
-  "success": false,
-  "employeeCode": "EMP001",
-  "employeeName": "Jane Doe",
-  "similarity": 0.5312,
-  "similarity_percentage": 53.12,
-  "threshold": 0.70,
-  "status": "FAILED_MATCH_UNDER_THRESHOLD",
-  "execution_time_ms": 139
-}
-```
 
-### 3. List Registered Employees
-- **Endpoint**: `GET /api/employees`
-- **Description**: Helper endpoint returning details of all registered employees and the number of registered face angles.
-- **Response**:
+Returns `404` for an unknown employee code, `400` if the employee has no registered embeddings or the image is invalid.
+
+### 3. List Registered Employees — `GET /api/employees`
+
+Helper endpoint returning all employees with their enrolled face-angle counts.
+
 ```json
 [
   {
     "id": 1,
-    "employee_code": "EMP001",
-    "first_name": "Jane",
-    "last_name": "Doe",
-    "created_at": "2026-06-18T07:15:00Z",
+    "employeeCode": "EMP001",
+    "firstName": "Jane",
+    "lastName": "Doe",
+    "createdAt": "2026-06-18T07:15:00Z",
     "faceAnglesCount": 2
   }
 ]
@@ -209,25 +217,42 @@ Audit logs of all check-in attempts.
 
 ## 🏃 Running the Application
 
-### 1. Running Locally with .NET Core CLI
-Ensure you have [.NET 8 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/8.0) installed.
+Requires the [.NET 8 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/8.0).
 
 ```bash
 # 1. Restore dependencies
 dotnet restore
 
-# 2. Run EF Core database migrations (updates PostgreSQL schema and activates pgvector extension)
-dotnet ef database update
-
-# 3. Build & run the API
+# 2. Run the API (from the project root, so ml-models/arc.onnx resolves)
 dotnet run
 ```
-The application will spin up locally (typically bound to CORS-allowed ports). You can check the local URL in the console output.
+
+CORS is fully open (`AllowAnyOrigin`) to make local frontend development (e.g. Next.js on `localhost:3000`) friction-free.
 
 ---
 
-## 🛡 Disclaimer
-This project is a **Proof of Concept (POC)** designed to demonstrate localized face vector extraction and pgvector storage. In a full production implementation:
-- **Liveness detection** should be integrated to prevent spoofing (e.g. holding a paper photo or phone screen up to the camera).
-- **Authentication and HTTPS** must be implemented to secure endpoints and image transmissions.
-- **Vector Search Indexing** (e.g. HNSW/IVFFlat index on pgvector) should be added to PostgreSQL for high-speed top-K similarity search as the user base scales.
+## 🧪 Testing
+
+An end-to-end PowerShell test suite is included:
+
+```powershell
+# Full suite with generated synthetic images
+.\test-api.ps1
+
+# Realistic accuracy test with real photos of the same person
+.\test-api.ps1 -RegisterImages front.jpg,left.jpg -CheckInImage today.jpg
+```
+
+The script exercises all three endpoints, covering happy paths and the documented validation/error responses. The API and PostgreSQL must both be running. `FaceAttendance.Api.http` is also available for quick manual requests from VS Code / JetBrains REST clients.
+
+---
+
+## 🛡 Disclaimer & Known Limitations
+
+This project is a **Proof of Concept (POC)**. Before any production use:
+
+- **No face detection/alignment** — the full image is resized to 112×112 and embedded, so tightly cropped face images give the best accuracy.
+- **Liveness detection** should be integrated to prevent spoofing (e.g. holding a printed photo or phone screen up to the camera).
+- **Authentication, rate limiting, and HTTPS** must be added — endpoints are currently completely open.
+- **Raw image storage** is not implemented (`image_path` is a placeholder).
+- **Vector index** (HNSW/IVFFlat on pgvector) should be added for high-speed top-K similarity search as the user base scales — example DDL is included at the bottom of `schema.sql`.
