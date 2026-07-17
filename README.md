@@ -2,6 +2,8 @@
 
 A lightweight C# ASP.NET Core 8 Web API demonstrating face recognition, vector storage, and similarity verification. This POC integrates **ONNX Runtime** for local face embedding extraction using the **ArcFace (`arc.onnx`)** model and **PostgreSQL with pgvector** for persistent vector storage and in-database similarity search.
 
+- Download model via: https://huggingface.co/garavv/arcface-onnx
+
 > 📖 Full endpoint reference (request/response schemas, error tables): [API-Documentation.md](API-Documentation.md)
 
 ---
